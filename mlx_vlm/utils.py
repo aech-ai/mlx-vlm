@@ -31,7 +31,12 @@ from .tokenizer_utils import load_tokenizer
 from .trainer import apply_lora_layers
 
 # Constants
-MODEL_REMAPPING = {"llava-qwen2": "llava_bunny", "bunny-llama": "llava_bunny"}
+MODEL_REMAPPING = {
+    "llava-qwen2": "llava_bunny",
+    "bunny-llama": "llava_bunny",
+    "Mistral-Small-3.1-24B-Instruct-2503": "mistral3",
+    "Mistral-Small-3.1-24B-Base-2503": "mistral3"
+}
 
 MAX_FILE_SIZE_GB = 5
 

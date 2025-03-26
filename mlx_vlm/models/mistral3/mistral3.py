@@ -9,9 +9,9 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
-from ..pixtral import LanguageModel
+from ..pixtral import LanguageModel as PixtralLanguageModel
 from ..pixtral import Model as PixtralModel
-from ..pixtral import TextConfig, VisionConfig, VisionModel
+from ..pixtral import TextConfig, VisionConfig, VisionModel as PixtralVisionModel
 
 
 @dataclass
@@ -229,6 +229,150 @@ class Mistral3MultiModalProjector(nn.Module):
         return x
 
 
+class LanguageModel(PixtralLanguageModel):
+    @staticmethod
+    def sanitize(weights):
+        # First do the standard sanitization from parent class
+        sanitized_weights = {}
+        
+        for k, v in weights.items():
+            # Skip removing freqs as in the original sanitize method
+            if "self_attn.rotary_emb.inv_freq" in k:
+                continue
+                
+            # Handle language model weights without 'language_model.' prefix
+            if k.startswith("layers."):
+                # Convert the layer weight format if needed
+                if ".feed_forward.w1.weight" in k:
+                    new_key = k.replace(".feed_forward.w1.weight", ".mlp.gate_proj.weight")
+                    sanitized_weights[new_key] = v
+                elif ".feed_forward.w2.weight" in k:
+                    new_key = k.replace(".feed_forward.w2.weight", ".mlp.down_proj.weight")
+                    sanitized_weights[new_key] = v
+                elif ".feed_forward.w3.weight" in k:
+                    new_key = k.replace(".feed_forward.w3.weight", ".mlp.up_proj.weight")
+                    sanitized_weights[new_key] = v
+                # Convert attention weights if needed
+                elif ".attention.wq.weight" in k:
+                    new_key = k.replace(".attention.wq.weight", ".self_attn.q_proj.weight")
+                    sanitized_weights[new_key] = v
+                elif ".attention.wk.weight" in k:
+                    new_key = k.replace(".attention.wk.weight", ".self_attn.k_proj.weight")
+                    sanitized_weights[new_key] = v
+                elif ".attention.wv.weight" in k:
+                    new_key = k.replace(".attention.wv.weight", ".self_attn.v_proj.weight")
+                    sanitized_weights[new_key] = v
+                elif ".attention.wo.weight" in k:
+                    new_key = k.replace(".attention.wo.weight", ".self_attn.o_proj.weight")
+                    sanitized_weights[new_key] = v
+                # Handle norm weights
+                elif ".attention_norm.weight" in k:
+                    new_key = k.replace(".attention_norm.weight", ".input_layernorm.weight")
+                    sanitized_weights[new_key] = v
+                elif ".ffn_norm.weight" in k:
+                    new_key = k.replace(".ffn_norm.weight", ".post_attention_layernorm.weight")
+                    sanitized_weights[new_key] = v
+                else:
+                    # For other layer weights, prepend 'model.' to match Pixtral's structure
+                    sanitized_weights[f"model.{k}"] = v
+            elif k == "norm.weight":
+                # Handle the final norm layer
+                sanitized_weights["model.norm.weight"] = v
+            elif k == "tok_embeddings.weight":
+                # Handle token embeddings
+                sanitized_weights["model.embed_tokens.weight"] = v
+            elif k == "output.weight":
+                # Handle output projection
+                sanitized_weights["lm_head.weight"] = v
+            else:
+                # Keep other weights as they are
+                sanitized_weights[k] = v
+                
+        return sanitized_weights
+
+
+class VisionModel(PixtralVisionModel):
+    @staticmethod
+    def sanitize(weights):
+        # First do the standard sanitization
+        sanitized_weights = {}
+        mistral_vision_weights = {}
+        
+        # Prefixes that might appear in the weights
+        vision_prefixes = ["vision_encoder.", "vision_model."]
+        
+        # Process weight mappings for Mistral3 vision encoder
+        for k, v in weights.items():
+            new_key = k
+            
+            # Handle various vision encoder prefixes
+            for prefix in vision_prefixes:
+                if k.startswith(prefix):
+                    # Standardize on vision_model prefix
+                    new_key = k.replace(prefix, "vision_model.")
+                    
+                    # Handle transformer layers
+                    if "transformer.layers" in new_key:
+                        # Convert feed_forward weights to MLX format
+                        if ".feed_forward.w1.weight" in new_key:
+                            new_key = new_key.replace(".feed_forward.w1.weight", ".feed_forward.gate_proj.weight")
+                        elif ".feed_forward.w2.weight" in new_key:
+                            new_key = new_key.replace(".feed_forward.w2.weight", ".feed_forward.down_proj.weight")
+                        elif ".feed_forward.w3.weight" in new_key:
+                            new_key = new_key.replace(".feed_forward.w3.weight", ".feed_forward.up_proj.weight")
+                        
+                        # Convert attention weights
+                        elif ".attention.wq.weight" in new_key:
+                            new_key = new_key.replace(".attention.wq.weight", ".attention.q_proj.weight")
+                        elif ".attention.wk.weight" in new_key:
+                            new_key = new_key.replace(".attention.wk.weight", ".attention.k_proj.weight")
+                        elif ".attention.wv.weight" in new_key:
+                            new_key = new_key.replace(".attention.wv.weight", ".attention.v_proj.weight")
+                        elif ".attention.wo.weight" in new_key:
+                            new_key = new_key.replace(".attention.wo.weight", ".attention.o_proj.weight")
+                            
+                        # Handle norm weights
+                        elif ".attention_norm.weight" in new_key:
+                            new_key = new_key.replace(".attention_norm.weight", ".attention_norm.weight")
+                        elif ".ffn_norm.weight" in new_key:
+                            new_key = new_key.replace(".ffn_norm.weight", ".ffn_norm.weight")
+                    
+                    # Handle other vision encoder weights
+                    if "patch_merger.merging_layer.weight" in new_key:
+                        # Keep as is, this is specific to Mistral3
+                        pass
+                    elif "pre_mm_projector_norm.weight" in new_key:
+                        # Handle special norm layers
+                        pass
+                    
+                    mistral_vision_weights[new_key] = v
+                    break
+            else:
+                # If no prefix matched, keep the original key
+                sanitized_weights[k] = v
+        
+        # Add sanitized Mistral vision weights to the result
+        for k, v in mistral_vision_weights.items():
+            # Handle the patch_conv weight which needs to be transposed
+            if "patch_conv.weight" in k:
+                if len(v.shape) == 4:
+                    sanitized_weights[k] = v.transpose(0, 2, 3, 1)
+                else:
+                    sanitized_weights[k] = v
+            else:
+                sanitized_weights[k] = v
+        
+        # Handle non-vision weights that need special processing
+        for k, v in weights.items():
+            # Handle language model weights, multimodal weights, etc.
+            if k.startswith("vision_language_adapter."):
+                sanitized_weights[k] = v
+            elif k == "pre_mm_projector_norm.weight":
+                sanitized_weights["vision_model.ln_pre.weight"] = v
+        
+        return sanitized_weights
+
+
 class Model(PixtralModel):
     def __init__(self, config: ModelConfig):
         super().__init__(config)
@@ -269,6 +413,11 @@ class Model(PixtralModel):
         selected_image_feature = hidden_states[self.vision_feature_layer]
 
         # Pass image features through the multi-modal projector
+        if image_sizes is None:
+            # Default to a square image size based on the number of patches
+            h, w = pixel_values.shape[2] // self.vision_tower.vision_model.config.patch_size, pixel_values.shape[3] // self.vision_tower.vision_model.config.patch_size
+            image_sizes = [(h, w)] * pixel_values.shape[0]
+            
         image_features = self.multi_modal_projector(selected_image_feature, image_sizes)
 
         # Insert special image tokens in the input_ids
@@ -301,3 +450,20 @@ class Model(PixtralModel):
         # Create a final embedding of shape
         # (1, num_image_patches*num_images + sequence_len, embed_dim)
         return mx.concatenate(final_embeddings, axis=1)
+
+    @staticmethod
+    def sanitize(weights):
+        # Handle model-specific weights 
+        sanitized_weights = {}
+        
+        for k, v in weights.items():
+            if k.startswith("vision_language_adapter."):
+                # Handle vision-language adapter weights
+                sanitized_weights[k] = v
+            elif k == "pre_mm_projector_norm.weight":
+                # This is a special norm layer in Mistral-Small-3.1
+                sanitized_weights[k] = v
+            else:
+                sanitized_weights[k] = v
+        
+        return sanitized_weights
