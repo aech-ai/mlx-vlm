@@ -1,4 +1,5 @@
 from functools import partial
+from typing import List, Dict, Any, Union
 
 
 def get_message_json(
@@ -158,26 +159,61 @@ def get_message_json(
 
 
 def get_chat_template(
-    processor, messages, add_generation_prompt, tokenize=False, **kwargs
+    processor,
+    messages: List[Dict[str, Union[str, List[Dict[str, str]]]]],
+    add_generation_prompt: bool = False,
+    **kwargs,
 ):
-    if "chat_template" in processor.__dict__.keys():
-        return processor.apply_chat_template(
-            messages,
-            tokenize=tokenize,
-            add_generation_prompt=add_generation_prompt,
-            **kwargs,
-        )
-    elif "tokenizer" in processor.__dict__.keys():
-        return processor.tokenizer.apply_chat_template(
-            messages,
-            tokenize=tokenize,
-            add_generation_prompt=add_generation_prompt,
-            **kwargs,
-        )
-    else:
-        raise ValueError(
-            "Error: processor does not have 'chat_template' or 'tokenizer' attribute."
-        )
+    """
+    Applies the chat template to a list of messages, handling multimodal list content.
+
+    Args:
+        processor: The processor object with tokenizer.
+        messages: List of message dictionaries. Content can be str or list for multimodal.
+        add_generation_prompt: Whether to add the generation prompt.
+        **kwargs: Additional arguments for apply_chat_template.
+
+    Returns:
+        The formatted prompt string.
+    """
+    # Use '[IMG]' as the default/expected token for this model type,
+    # based on the working example. A more robust solution might inspect
+    # processor.tokenizer.special_tokens_map or similar if available.
+    image_token = getattr(processor.tokenizer, "image_token", "[IMG]")
+
+    processed_messages_for_template = []
+    for msg in messages:
+        new_msg = msg.copy()
+        content = new_msg.get('content')
+
+        if isinstance(content, list):
+            # Handle multimodal content (list of dicts)
+            content_parts = []
+            for item in content:
+                if item.get('type') == 'image':
+                    # Use the correctly identified image_token
+                    content_parts.append(image_token)
+                elif item.get('type') == 'text':
+                    text_content = item.get('text', '')
+                    if text_content: # Avoid adding empty strings if text is missing
+                        content_parts.append(text_content)
+            # Join parts into a single string. Using newline as a separator.
+            # Adjust separator ("\n", " ", "") if needed based on model expectations.
+            new_msg['content'] = "\n".join(part for part in content_parts if part)
+        elif not isinstance(content, str):
+            # Ensure content is string type otherwise, handle None or other types
+            new_msg['content'] = str(content if content is not None else '')
+
+        processed_messages_for_template.append(new_msg)
+
+    # Apply the chat template to the processed messages to get the final prompt string
+    # Crucially set tokenize=False to get the string output
+    return processor.apply_chat_template(
+        processed_messages_for_template,
+        tokenize=False,
+        add_generation_prompt=add_generation_prompt,
+        **kwargs,
+    )
 
 
 def apply_chat_template(

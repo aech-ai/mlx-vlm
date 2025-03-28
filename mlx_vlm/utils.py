@@ -1016,92 +1016,174 @@ def stream_generate(
     model: nn.Module,
     processor: PreTrainedTokenizer,
     prompt: str,
-    image: Union[str, List[str]] = None,
+    image: Union[str, List[str], None] = None,
     **kwargs,
 ) -> Union[str, Generator[str, None, None]]:
     """
     A generator producing text based on the given prompt from the model.
-
-    Args:
-        prompt (mx.array): The input prompt.
-        model (nn.Module): The model to use for generation.
-        max_tokens (int): The ma
-        kwargs: The remaining options get passed to :func:`generate_step`.
-          See :func:`generate_step` for more details.
-
-    Yields:
-        Generator[Tuple[mx.array, mx.array]]: A generator producing text.
+    Handles both text-only and multimodal inputs by preparing inputs internally.
     """
     tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
-    add_special_tokens = not hasattr(processor, "chat_template")
-    prompt_tokens = mx.array(
-        tokenizer.encode(prompt, add_special_tokens=add_special_tokens)
-    )
+    # Chat templates usually handle special tokens, so False is often correct here
+    add_special_tokens = False
 
-    resize_shape = kwargs.pop("resize_shape", None)
-    image_token_index = getattr(model.config, "image_token_index", None)
+    # --- Input Preparation ---
+    input_ids = None
+    pixel_values = None
+    mask = None
+    data_kwargs = {} # To hold extra processor outputs if any
 
-    if kwargs.get("pixel_values") is None:
-        if not image:
-            input_ids = prompt_tokens[None, :]
-            pixel_values = mask = None
-        else:
-            inputs = prepare_inputs(
-                processor, image, prompt, image_token_index, resize_shape
-            )
-            input_ids = inputs["input_ids"]
-            pixel_values = inputs["pixel_values"]
-            mask = inputs["attention_mask"]
+    try:
+        if image:
+            # --- Multimodal Case ---
+            # Load the image using the existing helper function
+            loaded_image = load_image(image)
+
+            # Use the processor to handle both text (containing <image> token) and the loaded image
+            # Try returning NumPy arrays first, fall back to PyTorch tensors if needed
+            try:
+                # Pass text/images as lists for batch dimension consistency
+                inputs = processor(
+                    text=[prompt],
+                    images=[loaded_image],
+                    return_tensors="np",
+                    padding=True # Let processor handle padding
+                )
+                print("[INFO] Processed multimodal input with return_tensors='np'") # Debug info
+            except Exception as e_np:
+                print(f"\033[33mWarning\033[0m: Failed processing multimodal input with 'np': {e_np}. Trying 'pt'.")
+                try:
+                     inputs = processor(
+                        text=[prompt], images=[loaded_image], return_tensors="pt", padding=True
+                    )
+                     print("[INFO] Processed multimodal input with return_tensors='pt'") # Debug info
+                except Exception as e_pt:
+                     # If both fail, raise a clear error
+                     raise ValueError(f"Failed processing multimodal input with both 'np' and 'pt': {e_pt}") from e_pt
+
+            # Convert inputs to MLX arrays
+            input_ids = mx.array(inputs["input_ids"])
+            mask = mx.array(inputs["attention_mask"]) if "attention_mask" in inputs else None
+
+            # Handle pixel_values (might be under 'pixel_values' or 'images' key)
+            pv_key = "pixel_values" if "pixel_values" in inputs else "images"
+            if pv_key in inputs:
+                 pv = inputs[pv_key]
+                 # Ensure pv is a NumPy array before converting to MLX
+                 if not isinstance(pv, np.ndarray):
+                     try:
+                         # If using 'pt' fallback, it might be a torch tensor
+                         pv = pv.numpy()
+                     except AttributeError:
+                         # Handle cases where it might already be a list of arrays/tensors
+                         if isinstance(pv, list):
+                              pv = np.stack(pv) # Stack list into a single NumPy array
+                         else:
+                              raise TypeError(f"Unexpected type for pixel_values: {type(pv)}")
+                 pixel_values = mx.array(pv)
+            else:
+                 print("\033[33mWarning\033[0m: 'pixel_values' or 'images' not found in processor output.")
+                 pixel_values = None # Explicitly set to None if not found
+
+
+            # Pass along any other relevant keys returned by the processor
+            # Convert non-string/list values to mx.array
             data_kwargs = {
-                k: v
-                for k, v in inputs.items()
-                if k not in ["input_ids", "pixel_values", "attention_mask"]
+                k: mx.array(v) for k, v in inputs.items()
+                if k not in ["input_ids", "pixel_values", "attention_mask", "images"] and not isinstance(v, (str, list))
             }
+            # Update kwargs for generate_step, prioritizing specific data_kwargs
             kwargs.update(data_kwargs)
-    else:
-        input_ids = kwargs.pop("input_ids")
-        pixel_values = kwargs.pop("pixel_values")
-        mask = kwargs.pop("mask")
 
+        else:
+            # --- Text-Only Case ---
+            # Tokenize the prompt directly using the tokenizer
+            # Use np tensors directly as MLX handles them well
+            inputs = tokenizer(
+                [prompt], # Pass prompt as a list for batch consistency
+                return_tensors="np",
+                padding=True, # Handle padding/truncation as needed
+                add_special_tokens=add_special_tokens
+            )
+            input_ids = mx.array(inputs["input_ids"])
+            mask = mx.array(inputs["attention_mask"]) if "attention_mask" in inputs else None
+            pixel_values = None # No image
+
+    except Exception as e:
+        print(f"\033[31mError\033[0m during input preparation: {e}")
+        # Yield an error message to the UI and stop
+        yield GenerationResult(text=f"Error preparing input: {e}", token=None, logprobs=None, prompt_tokens=0, generation_tokens=0, prompt_tps=0, generation_tps=0, peak_memory=mx.get_peak_memory() / 1e9)
+        return # Stop generation if preparation fails
+
+    # Check if essential inputs were successfully created
+    if input_ids is None:
+         yield GenerationResult(text="Error: input_ids could not be generated.", token=None, logprobs=None, prompt_tokens=0, generation_tokens=0, prompt_tps=0, generation_tps=0, peak_memory=mx.get_peak_memory() / 1e9)
+         return
+
+    # --- Generation ---
     detokenizer = processor.detokenizer
     detokenizer.reset()
     tic = time.perf_counter()
-    for n, (token, logprobs) in enumerate(
-        generate_step(input_ids, model, pixel_values, mask, **kwargs)
-    ):
-        if n == 0:
-            prompt_time = time.perf_counter() - tic
-            prompt_tps = input_ids.size / prompt_time
-            tic = time.perf_counter()
+    prompt_tps = 0.0 # Initialize prompt timing info
+    n = -1 # Initialize token counter
 
-        if token == tokenizer.eos_token_id:
-            break
+    try:
+        # Pass the prepared inputs to generate_step
+        # kwargs includes temperature, max_tokens, etc., and any extra data_kwargs from processor
+        for n, (token, logprobs) in enumerate(
+            generate_step(input_ids, model, pixel_values, mask, **kwargs)
+        ):
+            if n == 0:
+                prompt_time = time.perf_counter() - tic
+                # Handle potential division by zero if prompt_time is very small
+                prompt_tps = input_ids.size / prompt_time if prompt_time > 1e-6 else 0.0
+                tic = time.perf_counter() # Reset timer for generation
 
-        detokenizer.add_token(token)
+            if token == tokenizer.eos_token_id:
+                break
 
-        # Yield the last segment if streaming
+            detokenizer.add_token(token)
+
+            gen_time = time.perf_counter() - tic
+            # Handle potential division by zero
+            gen_tps = (n + 1) / gen_time if gen_time > 1e-6 else 0.0
+
+            # Yield the incremental generation result
+            yield GenerationResult(
+                text=detokenizer.last_segment,
+                token=token,
+                logprobs=logprobs,
+                prompt_tokens=input_ids.size,
+                generation_tokens=n + 1,
+                prompt_tps=prompt_tps,
+                generation_tps=gen_tps,
+                peak_memory=mx.get_peak_memory() / 1e9,
+            )
+
+        # --- Finalization after loop ends (EOS or max_tokens) ---
+        detokenizer.finalize()
+        final_gen_tokens = n + 1
+        final_gen_time = time.perf_counter() - tic if n >= 0 else 0 # Avoid negative time if loop didn't run
+        final_gen_tps = final_gen_tokens / final_gen_time if final_gen_time > 1e-6 else 0.0
+        final_token = token if n >= 0 else None
+        final_logprobs = logprobs if n >= 0 else None
+
+        # Yield the final result chunk
         yield GenerationResult(
-            text=detokenizer.last_segment,
-            token=token,
-            logprobs=logprobs,
+            text=detokenizer.last_segment, # Any remaining text in the detokenizer
+            token=final_token,
+            logprobs=final_logprobs,
             prompt_tokens=input_ids.size,
-            generation_tokens=n + 1,
+            generation_tokens=final_gen_tokens,
             prompt_tps=prompt_tps,
-            generation_tps=(n + 1) / (time.perf_counter() - tic),
-            peak_memory=mx.metal.get_peak_memory() / 1e9,
+            generation_tps=final_gen_tps,
+            peak_memory=mx.get_peak_memory() / 1e9,
         )
 
-    detokenizer.finalize()
-    yield GenerationResult(
-        text=detokenizer.last_segment,
-        token=token,
-        logprobs=logprobs,
-        prompt_tokens=input_ids.size,
-        generation_tokens=n + 1,
-        prompt_tps=prompt_tps,
-        generation_tps=(n + 1) / (time.perf_counter() - tic),
-        peak_memory=mx.metal.get_peak_memory() / 1e9,
-    )
+    except Exception as e:
+        print(f"\033[31mError\033[0m during generation step: {e}")
+        # Yield error details to UI
+        yield GenerationResult(text=f"Error during generation: {e}", token=None, logprobs=None, prompt_tokens=input_ids.size, generation_tokens=n + 1, prompt_tps=prompt_tps, generation_tps=0, peak_memory=mx.get_peak_memory() / 1e9)
 
 
 def generate(
