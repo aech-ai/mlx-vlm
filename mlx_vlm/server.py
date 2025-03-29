@@ -316,6 +316,9 @@ class APIHandler(BaseHTTPRequestHandler):
         temp_paths = []
         created_files = [] # Keep track of successfully created file objects for cleanup
         
+        # Set a consistent size for all images to avoid reshape errors
+        target_size = (224, 224)  # Common size for vision transformers
+        
         try:
             for i, url in enumerate(image_urls):
                 pil_image = None
@@ -325,6 +328,10 @@ class APIHandler(BaseHTTPRequestHandler):
                     logging.debug(f"Preparing image {i+1}/{len(image_urls)} from URL: {url[:100]}...")
                     pil_image = load_image_from_url(url)
                     logging.debug(f"Loaded image {i+1} successfully: {pil_image.size}, mode: {pil_image.mode}")
+                    
+                    # Resize all images to the same dimensions to avoid reshape errors
+                    pil_image = pil_image.resize(target_size, Image.LANCZOS)
+                    logging.debug(f"Resized image {i+1} to {target_size}")
 
                     temp_file = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
                     temp_path = temp_file.name
@@ -475,9 +482,23 @@ class APIHandler(BaseHTTPRequestHandler):
         
         # --- Use the pre-processed messages for get_chat_template --- 
         try:
+            # Determine if this is a mistral model from config or model name
+            model_type = ""
+            if hasattr(model, "config") and hasattr(model.config, "model_type"):
+                model_type = model.config.model_type
+            elif "mistral" in self.requested_model.lower():
+                model_type = "mistral3"
+                
             # Pass the processor and the *potentially modified* messages list
-            prompt_text = get_chat_template(processor, processed_messages_for_template, add_generation_prompt=True)
-            logging.debug(f"Using get_chat_template with pre-processed messages: {prompt_text[:200]}...")
+            # Include model_type for special handling in get_chat_template
+            prompt_text = get_chat_template(
+                processor, 
+                processed_messages_for_template, 
+                add_generation_prompt=True,
+                model_type=model_type,
+                num_images=len(image_urls) if image_urls else 0
+            )
+            logging.debug(f"Using get_chat_template with pre-processed messages and model_type={model_type}: {prompt_text[:200]}...")
         except Exception as e:
             logging.error(f"get_chat_template failed even with pre-processing: {str(e)}. Falling back to basic default.")
             # Fallback using the *original* messages might be safer here if pre-processing failed
@@ -515,25 +536,31 @@ class APIHandler(BaseHTTPRequestHandler):
         
         try:
             # Process the images separately if needed
-            image_paths_for_generate = []
+            image_paths = []
+            image_sizes = []
             if image_urls:
                 # Use the helper method which now returns lists
                 temp_paths, temp_files_objs = self._prepare_image_for_generation(image_urls)
                 if temp_paths:
-                    image_paths_for_generate = temp_paths
+                    # Collect paths and image sizes without converting to PIL objects
+                    for img_path in temp_paths:
+                        # Just get the dimensions for sizing without holding the image in memory
+                        with Image.open(img_path) as img:
+                            image_sizes.append([img.height, img.width])
+                        image_paths.append(img_path)
                     temp_files = temp_files_objs # Store file objs list for cleanup in finally
                 else:
                      # Error already logged in helper, raise specific error
                      raise ValueError("Image preparation failed, check logs.")
             
             # Determine generator based on whether images were processed
-            if image_paths_for_generate:
-                logging.debug(f"Calling stream_generate with {len(image_paths_for_generate)} image path(s): {', '.join(image_paths_for_generate)}")
+            if image_paths:
+                logging.debug(f"Calling stream_generate with {len(image_paths)} image path(s): {', '.join(image_paths)}")
                 generator = stream_generate(
                     model=model,
                     processor=processor,
                     prompt=prompt_text,
-                    image=image_paths_for_generate,  # Pass the LIST of file paths
+                    image=image_paths,  # Pass the LIST of file paths directly
                     **generation_kwargs
                 )
             else:
@@ -623,25 +650,31 @@ class APIHandler(BaseHTTPRequestHandler):
         
         try:
             # Process the images separately if needed
-            image_paths_for_generate = []
+            image_paths = []
+            image_sizes = []
             if image_urls:
                  # Use the helper method which now returns lists
                 temp_paths, temp_files_objs = self._prepare_image_for_generation(image_urls)
                 if temp_paths:
-                    image_paths_for_generate = temp_paths
+                    # Collect paths and image sizes without converting to PIL objects
+                    for img_path in temp_paths:
+                        # Just get the dimensions for sizing without holding the image in memory
+                        with Image.open(img_path) as img:
+                            image_sizes.append([img.height, img.width])
+                        image_paths.append(img_path)
                     temp_files = temp_files_objs # Store file objs list for cleanup in finally
                 else:
                     # Error already logged in helper, raise specific error
                     raise ValueError("Image preparation failed, check logs.")
             
             # Determine generator based on whether images were processed
-            if image_paths_for_generate:
-                logging.debug(f"Calling stream_generate with {len(image_paths_for_generate)} image path(s): {', '.join(image_paths_for_generate)}")
+            if image_paths:
+                logging.debug(f"Calling stream_generate with {len(image_paths)} image path(s): {', '.join(image_paths)}")
                 generator = stream_generate(
                     model=model,
                     processor=processor,
                     prompt=prompt_text,
-                    image=image_paths_for_generate,  # Pass the LIST of file paths
+                    image=image_paths,  # Pass the LIST of file paths directly
                     **generation_kwargs
                 )
             else:

@@ -1,5 +1,6 @@
 from functools import partial
 from typing import List, Dict, Any, Union
+import logging
 
 
 def get_message_json(
@@ -106,6 +107,10 @@ def get_message_json(
         "idefics3": "message_list_with_image_first",
         "aya_vision": "message_list_with_image_first",
         "mistral3": "message_list_with_image_first",
+        "mistral-small": "message_list_with_image_first",
+        "mistral-small-3.1": "message_list_with_image_first",
+        "small_3.1": "message_list_with_image_first",
+        "mistral_small": "message_list_with_image_first",
         "gemma3": "message_with_start_image_token",
         "smolvlm": "message_list_with_image_first",
         "llava": "message_list_with_image",
@@ -181,6 +186,23 @@ def get_chat_template(
     # processor.tokenizer.special_tokens_map or similar if available.
     image_token = getattr(processor.tokenizer, "image_token", "[IMG]")
 
+    # For special models with unique processing requirements
+    model_type = kwargs.get("model_type", "")
+    
+    # For mistral models, directly use the processed messages since the tokenizer will handle image tokens correctly
+    if model_type == "mistral3" or model_type.startswith("mistral"):
+        try:
+            if hasattr(processor, "apply_chat_template"):
+                return processor.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=add_generation_prompt,
+                    **kwargs,
+                )
+        except Exception as e:
+            logging.warning(f"Direct application of chat template failed: {e}. Falling back to manual processing.")
+    
+    # Standard processing for other models
     processed_messages_for_template = []
     for msg in messages:
         new_msg = msg.copy()
@@ -195,11 +217,24 @@ def get_chat_template(
                     content_parts.append(image_token)
                 elif item.get('type') == 'text':
                     text_content = item.get('text', '')
-                    if text_content: # Avoid adding empty strings if text is missing
+                    if text_content:  # Avoid adding empty strings if text is missing
                         content_parts.append(text_content)
+                    
+            # Ensure all parts are strings (handle nested structures)
+            string_parts = []
+            for part in content_parts:
+                if isinstance(part, str):
+                    string_parts.append(part)
+                elif isinstance(part, list):
+                    # If it's a list, convert to string or handle appropriately
+                    string_parts.append(str(part))
+                else:
+                    # Handle other types
+                    string_parts.append(str(part))
+                    
             # Join parts into a single string. Using newline as a separator.
             # Adjust separator ("\n", " ", "") if needed based on model expectations.
-            new_msg['content'] = "\n".join(part for part in content_parts if part)
+            new_msg['content'] = "\n".join(string_parts)
         elif not isinstance(content, str):
             # Ensure content is string type otherwise, handle None or other types
             new_msg['content'] = str(content if content is not None else '')
