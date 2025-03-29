@@ -47,26 +47,59 @@ def test_multi_image_generation(
     # Load the images
     images = []
     processed_image_paths = []
+    
+    # First, load all images and find the max dimensions
+    loaded_images = []
+    max_width = 0
+    max_height = 0
+    
     for path in image_paths:
         logging.info(f"Loading image from {path}")
         if not os.path.exists(path):
             raise FileNotFoundError(f"Image file not found: {path}")
             
-        # Load and resize the image to a consistent size to avoid reshape errors
+        # Load the image without resizing
         img = Image.open(path)
         if img.mode != "RGB":
             img = img.convert("RGB")
+            
+        # Keep track of maximum dimensions
+        width, height = img.size
+        max_width = max(max_width, width)
+        max_height = max(max_height, height)
         
-        # Resize to consistent dimensions
-        img = img.resize((224, 224), Image.LANCZOS)
+        loaded_images.append(img)
+    
+    logging.info(f"All images loaded. Maximum dimensions: {max_width}x{max_height}")
+    
+    # Process each image - padding to consistent dimensions if needed
+    for i, img in enumerate(loaded_images):
+        width, height = img.size
+        needs_padding = width < max_width or height < max_height
         
-        # Save the resized image to a temporary file
-        temp_file = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
+        if needs_padding:
+            logging.info(f"Padding image {i+1} from {width}x{height} to {max_width}x{max_height}")
+            # Create a new image with the max dimensions and paste the original
+            padded_image = Image.new("RGB", (max_width, max_height), color=(0, 0, 0))
+            padded_image.paste(img, (0, 0))  # Paste at top-left corner
+            process_image = padded_image
+        else:
+            process_image = img
+        
+        # Determine appropriate file extension based on image format
+        if hasattr(img, 'format') and img.format:
+            ext = f".{img.format.lower()}"
+        else:
+            ext = ".jpg"  # Default to jpg if format is unknown
+            
+        # Save the image to a temporary file with consistent dimensions
+        temp_file = tempfile.NamedTemporaryFile(suffix=ext, delete=False)
         temp_path = temp_file.name
         temp_file.close()
-        img.save(temp_path, format="JPEG")
+        process_image.save(temp_path, format=img.format or "JPEG")
+        logging.info(f"Saved image to {temp_path} with dimensions {process_image.size}")
         
-        images.append(img)
+        images.append(process_image)
         processed_image_paths.append(temp_path)
     
     # Get image sizes for the model if needed

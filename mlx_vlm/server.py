@@ -311,38 +311,74 @@ class APIHandler(BaseHTTPRequestHandler):
             self.wfile.write(b'{"error": "Not Found"}')
 
     def _prepare_image_for_generation(self, image_urls: List[str]) -> Tuple[List[str], List[tempfile._TemporaryFileWrapper]]:
-        """Loads images from a list of URLs, saves each to a temp file, returns lists of paths and file objects."""
+        """Loads images from a list of URLs, pads to consistent dimensions, returns lists of paths and file objects."""
         temp_files = []
         temp_paths = []
         created_files = [] # Keep track of successfully created file objects for cleanup
         
-        # Set a consistent size for all images to avoid reshape errors
-        target_size = (224, 224)  # Common size for vision transformers
-        
         try:
+            # First, load all images and determine the max dimensions
+            loaded_images = []
+            max_width = 0
+            max_height = 0
+            
             for i, url in enumerate(image_urls):
-                pil_image = None
-                temp_file = None
-                temp_path = None
                 try:
-                    logging.debug(f"Preparing image {i+1}/{len(image_urls)} from URL: {url[:100]}...")
+                    logging.debug(f"Loading image {i+1}/{len(image_urls)} from URL: {url[:100]}...")
                     pil_image = load_image_from_url(url)
                     logging.debug(f"Loaded image {i+1} successfully: {pil_image.size}, mode: {pil_image.mode}")
                     
-                    # Resize all images to the same dimensions to avoid reshape errors
-                    pil_image = pil_image.resize(target_size, Image.LANCZOS)
-                    logging.debug(f"Resized image {i+1} to {target_size}")
-
-                    temp_file = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
+                    # Convert to RGB for consistency
+                    if pil_image.mode != "RGB":
+                        pil_image = pil_image.convert("RGB")
+                        
+                    # Track maximum dimensions
+                    width, height = pil_image.size
+                    max_width = max(max_width, width)
+                    max_height = max(max_height, height)
+                    
+                    loaded_images.append(pil_image)
+                    
+                except Exception as e_inner:
+                    logging.error(f"Error loading image {i+1} from URL {url[:100]}...: {str(e_inner)}")
+                    # Continue to the next image URL
+            
+            if not loaded_images:
+                raise ValueError("Failed to load any images from the provided URLs.")
+                
+            logging.debug(f"All images loaded. Maximum dimensions: {max_width}x{max_height}")
+            
+            # Now process each image - padding to the same dimensions if needed
+            for i, pil_image in enumerate(loaded_images):
+                try:
+                    # Determine if we need to pad
+                    width, height = pil_image.size
+                    needs_padding = width < max_width or height < max_height
+                    
+                    if needs_padding:
+                        logging.debug(f"Padding image {i+1} from {width}x{height} to {max_width}x{max_height}")
+                        # Create a new image with the max dimensions and paste the original
+                        padded_image = Image.new("RGB", (max_width, max_height), color=(0, 0, 0))
+                        padded_image.paste(pil_image, (0, 0))  # Paste at top-left corner
+                        process_image = padded_image
+                    else:
+                        process_image = pil_image
+                    
+                    # Determine the appropriate file extension based on image format
+                    if hasattr(pil_image, 'format') and pil_image.format:
+                        ext = f".{pil_image.format.lower()}"
+                    else:
+                        ext = ".jpg"  # Default to jpg if format is unknown
+                    
+                    # Create a temporary file with the appropriate extension
+                    temp_file = tempfile.NamedTemporaryFile(suffix=ext, delete=False)
                     temp_path = temp_file.name
                     temp_file.close() # Close for saving
                     logging.debug(f"Temporary file path created for image {i+1}: {temp_path}")
 
-                    if pil_image.mode != "RGB":
-                        pil_image = pil_image.convert("RGB")
-
-                    pil_image.save(temp_path, format="JPEG")
-                    logging.debug(f"Saved image {i+1} to temporary file: {temp_path}")
+                    # Save with consistent dimensions through padding, not resizing
+                    process_image.save(temp_path, format=pil_image.format or "JPEG")
+                    logging.debug(f"Saved image {i+1} to temporary file: {temp_path} with dimensions {process_image.size}")
 
                     if os.path.exists(temp_path) and os.path.getsize(temp_path) > 0:
                         logging.debug(f"Temporary file for image {i+1} verified: {temp_path}")
@@ -357,12 +393,8 @@ class APIHandler(BaseHTTPRequestHandler):
                         # Do not add to temp_paths or created_files, effectively skipping this image
 
                 except Exception as e_inner:
-                    logging.error(f"Error processing image {i+1} from URL {url[:100]}...: {str(e_inner)}")
-                    # Clean up the specific temp file if created before the error
-                    if temp_path and os.path.exists(temp_path):
-                        try: os.unlink(temp_path)
-                        except OSError as e_unlink: logging.warning(f"Error deleting temp file {temp_path} after inner exception: {e_unlink}")
-                    # Continue to the next image URL
+                    logging.error(f"Error processing image {i+1}: {str(e_inner)}")
+                    # Continue to the next image
             
             # Check if at least one image was processed successfully
             if not temp_paths:
