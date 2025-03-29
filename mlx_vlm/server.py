@@ -96,13 +96,14 @@ class ModelProvider:
         return self.model, self.processor
 
 
-def process_message_content(messages):
+def process_message_content(messages) -> List[str]:
     """Process message content to handle multimodal inputs (images).
-    Extracts the first image URL found but leaves the original content structure intact.
+    Extracts all image URLs found but leaves the original content structure intact.
+    Returns a list of image URLs.
     """
-    image_url_found = None # Store the first image URL found across all messages
+    image_urls_found = [] # Store all image URLs found
     
-    for message in messages:
+    for message_index, message in enumerate(messages):
         if isinstance(message.get("content"), list):
             has_image = False
             text_parts = [] # Collect text parts for logging/debugging if needed
@@ -116,20 +117,25 @@ def process_message_content(messages):
                     # Extract the URL (either base64 or regular)
                     image_data = content_part.get("image_url", {})
                     url = image_data.get("url")
-                    if url and not image_url_found: # Store the *first* image URL we find
-                        image_url_found = url
-                        logging.debug(f"Found image URL in message content: {url[:100] if url else 'None'}...")
+                    if url: # Store every valid image URL we find
+                        image_urls_found.append(url)
+                        logging.debug(f"Found image URL in message {message_index}: {url[:100] if url else 'None'}...")
             
             # Log what we found, but DON'T modify message["content"]
             text_content_for_log = " ".join(text_parts)
-            logging.debug(f"Processed message: content remains list, found image: {has_image}, text parts: '{text_content_for_log}', first image URL stored: {'Yes' if image_url_found == url else 'No (already found one earlier)'}")
+            logging.debug(f"Processed message {message_index}: content remains list, found image: {has_image}, text parts: '{text_content_for_log}', total images found so far: {len(image_urls_found)}")
             
         elif isinstance(message.get("content"), str):
              # If content is already a string, just log it
              logging.debug(f"Processed message: content is already a string: '{message['content'][:100]}...'")
 
-    # Return the first image URL found (or None)
-    return image_url_found
+    # Return the list of image URLs found (can be empty)
+    # Limit to 10 images as requested
+    if len(image_urls_found) > 10:
+        logging.warning(f"Found {len(image_urls_found)} images, but limiting to the first 10.")
+        image_urls_found = image_urls_found[:10]
+        
+    return image_urls_found
 
 
 def default_chat_template(messages, template=""):
@@ -304,52 +310,69 @@ class APIHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(b'{"error": "Not Found"}')
 
-    def _prepare_image_for_generation(self, image_url: str) -> Tuple[Optional[str], Optional[tempfile._TemporaryFileWrapper]]:
-        """Loads image from URL, saves to temp file, returns path and file object."""
-        temp_file = None
-        temp_path = None
+    def _prepare_image_for_generation(self, image_urls: List[str]) -> Tuple[List[str], List[tempfile._TemporaryFileWrapper]]:
+        """Loads images from a list of URLs, saves each to a temp file, returns lists of paths and file objects."""
+        temp_files = []
+        temp_paths = []
+        created_files = [] # Keep track of successfully created file objects for cleanup
+        
         try:
-            pil_image = load_image_from_url(image_url)
-            logging.debug(f"Loaded image successfully: {pil_image.size}, mode: {pil_image.mode}")
+            for i, url in enumerate(image_urls):
+                pil_image = None
+                temp_file = None
+                temp_path = None
+                try:
+                    logging.debug(f"Preparing image {i+1}/{len(image_urls)} from URL: {url[:100]}...")
+                    pil_image = load_image_from_url(url)
+                    logging.debug(f"Loaded image {i+1} successfully: {pil_image.size}, mode: {pil_image.mode}")
 
-            temp_file = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
-            temp_path = temp_file.name
-            temp_file.close() # Close for saving
+                    temp_file = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
+                    temp_path = temp_file.name
+                    temp_file.close() # Close for saving
+                    logging.debug(f"Temporary file path created for image {i+1}: {temp_path}")
 
-            logging.debug(f"Temporary file path created: {temp_path}")
+                    if pil_image.mode != "RGB":
+                        pil_image = pil_image.convert("RGB")
 
-            if pil_image.mode != "RGB":
-                pil_image = pil_image.convert("RGB")
+                    pil_image.save(temp_path, format="JPEG")
+                    logging.debug(f"Saved image {i+1} to temporary file: {temp_path}")
 
-            pil_image.save(temp_path, format="JPEG")
-            logging.debug(f"Saved image to temporary file: {temp_path}")
+                    if os.path.exists(temp_path) and os.path.getsize(temp_path) > 0:
+                        logging.debug(f"Temporary file for image {i+1} verified: {temp_path}")
+                        temp_paths.append(temp_path)
+                        created_files.append(temp_file) # Add successfully created file obj for later cleanup
+                    else:
+                        logging.error(f"Failed to save or verify temporary file for image {i+1}: {temp_path}")
+                        # Clean up this specific failed file if it exists
+                        if temp_path and os.path.exists(temp_path):
+                            try: os.unlink(temp_path)
+                            except OSError as e: logging.warning(f"Error deleting failed temp file {temp_path}: {e}")
+                        # Do not add to temp_paths or created_files, effectively skipping this image
 
-            # Verify save
-            if os.path.exists(temp_path) and os.path.getsize(temp_path) > 0:
-                logging.debug(f"Temporary file verified (exists, size > 0): {temp_path}")
-                return temp_path, temp_file # Return path AND the file object wrapper for cleanup
-            else:
-                logging.error(f"Failed to save or verify temporary image file: {temp_path}")
-                # Clean up if save failed
-                if temp_file:
-                    try:
-                        os.unlink(temp_path)
-                    except OSError as e:
-                         logging.warning(f"Error deleting failed temp file {temp_path}: {e}")
-                return None, None
+                except Exception as e_inner:
+                    logging.error(f"Error processing image {i+1} from URL {url[:100]}...: {str(e_inner)}")
+                    # Clean up the specific temp file if created before the error
+                    if temp_path and os.path.exists(temp_path):
+                        try: os.unlink(temp_path)
+                        except OSError as e_unlink: logging.warning(f"Error deleting temp file {temp_path} after inner exception: {e_unlink}")
+                    # Continue to the next image URL
+            
+            # Check if at least one image was processed successfully
+            if not temp_paths:
+                 raise ValueError("Failed to prepare any images from the provided URLs.")
+                 
+            return temp_paths, created_files
 
-        except Exception as e:
-            logging.error(f"Error preparing image: {str(e)}")
-            # Clean up if any exception occurred
-            if temp_path and os.path.exists(temp_path):
-                 try:
-                     os.unlink(temp_path)
-                 except OSError as e_unlink:
-                     logging.warning(f"Error deleting temp file {temp_path} after exception: {e_unlink}")
-            elif temp_file:
-                 # If temp_file object exists but path wasn't set or file wasn't created
-                 pass # Nothing to unlink
-            raise ValueError(f"Failed to prepare image: {str(e)}")
+        except Exception as e_outer: # Catch broader errors, though inner loop handles most image specifics
+            logging.error(f"Outer error during image preparation loop: {str(e_outer)}")
+            # Attempt cleanup of any files created before the outer error
+            for f in created_files:
+                try:
+                    if os.path.exists(f.name):
+                         os.unlink(f.name)
+                except Exception as e_cleanup:
+                    logging.warning(f"Error during cleanup after outer exception for {f.name}: {e_cleanup}")
+            raise # Re-raise the exception that caused the failure
 
     def handle_chat_completions(self, model, processor, tokenizer):
         """
@@ -370,12 +393,12 @@ class APIHandler(BaseHTTPRequestHandler):
         frequency_penalty = float(self.body.get("frequency_penalty", 0.0))
         presence_penalty = float(self.body.get("presence_penalty", 0.0))
 
-        # Process messages for multimodal content - extracts first image URL, leaves structure
+        # Process messages for multimodal content - returns a LIST of image URLs
         messages = self.body["messages"]
-        image_url = process_message_content(messages) # Returns first image URL or None
+        image_urls = process_message_content(messages) # Now returns List[str]
         logging.debug(f"Original messages structure: {json.dumps(messages)}")
-        if image_url:
-             logging.debug(f"Extracted image URL for loading: {image_url[:100] if image_url else 'None'}...")
+        if image_urls:
+             logging.debug(f"Extracted {len(image_urls)} image URLs for loading.")
 
         # --- ADDED: Prepare messages for template using get_message_json --- 
         processed_messages_for_template = []
@@ -384,19 +407,18 @@ class APIHandler(BaseHTTPRequestHandler):
             model_type = model_config.model_type
             logging.debug(f"Detected model_type for get_message_json: {model_type}")
             
-            # Identify which message contains the image URL we are using
-            image_message_index = -1
-            if image_url:
+            # This logic might need adjustment for multiple images within a single message turn
+            # Currently identifies the *first* message containing *any* of the extracted image URLs
+            image_message_indices = set()
+            if image_urls:
                 for i, msg in enumerate(messages):
                     if isinstance(msg.get("content"), list):
                         for part in msg["content"]:
-                            if part.get("type") == "image_url" and part.get("image_url", {}).get("url") == image_url:
-                                image_message_index = i
-                                break
-                    if image_message_index != -1:
-                        break
+                            if part.get("type") == "image_url" and part.get("image_url", {}).get("url") in image_urls:
+                                image_message_indices.add(i)
+                                # Don't break, allow finding multiple images in the same message if needed later
             
-            logging.debug(f"Message index containing the target image_url: {image_message_index}")
+            logging.debug(f"Message indices containing target image URLs: {sorted(list(image_message_indices))}")
 
             for i, msg in enumerate(messages):
                 role = msg["role"]
@@ -407,29 +429,34 @@ class APIHandler(BaseHTTPRequestHandler):
                 # Extract text and count images from the original content list/string
                 if isinstance(original_content, list):
                     text_parts = []
+                    msg_image_urls = []
                     for part in original_content:
                         if part.get("type") == "text":
                             text_parts.append(part.get("text", ""))
                         elif part.get("type") == "image_url":
-                            num_images_in_msg += 1
+                            url = part.get("image_url", {}).get("url")
+                            if url in image_urls: # Count only the images we are processing
+                                num_images_in_msg += 1
+                                msg_image_urls.append(url)
                     text_content_for_json = " ".join(text_parts)
+                    logging.debug(f"Message {i} contains {num_images_in_msg} target images.")
                 elif isinstance(original_content, str):
                     text_content_for_json = original_content
                     num_images_in_msg = 0 # Assume no image if content is just string
                 
                 # Determine if we should skip the image token for this message
-                # Skip if it's not the message containing the *specific* image_url we are processing
-                skip_image = (i != image_message_index)
+                # This simple check might need refinement. Assumes image tokens needed only in messages that originally contained images.
+                skip_image = (i not in image_message_indices)
                 
                 logging.debug(f"Calling get_message_json for msg {i}: role={role}, text='{text_content_for_json[:50]}...', skip_image={skip_image}, num_images={num_images_in_msg}")
                 
-                # Call get_message_json to format content (potentially adding <image>)
+                # Call get_message_json to format content (potentially adding <image> tokens)
                 formatted_content_or_dict = get_message_json(
                     model_type=model_type,
                     model_name=self.requested_model,
                     prompt=text_content_for_json,
                     role=role, 
-                    skip_image_token=skip_image,
+                    skip_image_token=skip_image, # Still potentially simplistic
                     num_images=num_images_in_msg # Pass the count for the current msg
                 )
                 
@@ -466,52 +493,52 @@ class APIHandler(BaseHTTPRequestHandler):
             "stop": stop,
         }
         
-        # Log the final prompt with image
-        image_tag = "with image" if image_url else "without image"
+        # Log the final prompt with image(s)
+        image_tag = f"with {len(image_urls)} image(s)" if image_urls else "without image"
         logging.info(f"===== FINAL PROMPT ({image_tag}) =====")
         logging.info(prompt_text)
         logging.info("=================================")
         
-        logging.debug(f"Calling generation with prompt: {prompt_text[:100]}... and image: {'Yes' if image_url else 'No'}")
+        logging.debug(f"Calling generation with prompt: {prompt_text[:100]}... and {len(image_urls) if image_urls else 0} image(s)")
         
-        # Stream or complete generation
+        # Stream or complete generation - pass image_urls list
         if self.stream:
-            self._stream_chat_completion(model, processor, prompt_text, image_url, generation_kwargs)
+            self._stream_chat_completion(model, processor, prompt_text, image_urls, generation_kwargs)
         else:
-            self._complete_chat(model, processor, prompt_text, image_url, generation_kwargs)
+            self._complete_chat(model, processor, prompt_text, image_urls, generation_kwargs)
             
-    def _stream_chat_completion(self, model, processor, prompt_text, image_url, generation_kwargs):
+    def _stream_chat_completion(self, model, processor, prompt_text, image_urls: List[str], generation_kwargs):
         """Stream chat completion using the built-in stream_generate function."""
         first_token = True
         full_text = ""
-        temp_file = None
+        temp_files = [] # Store list of temp file objects for cleanup
         
         try:
-            # Process the image separately if needed
-            image_path_for_generate = None
-            if image_url:
-                # Use the helper method
-                temp_path, temp_file_obj = self._prepare_image_for_generation(image_url)
-                if temp_path:
-                    image_path_for_generate = temp_path
-                    temp_file = temp_file_obj # Store file obj for cleanup in finally
+            # Process the images separately if needed
+            image_paths_for_generate = []
+            if image_urls:
+                # Use the helper method which now returns lists
+                temp_paths, temp_files_objs = self._prepare_image_for_generation(image_urls)
+                if temp_paths:
+                    image_paths_for_generate = temp_paths
+                    temp_files = temp_files_objs # Store file objs list for cleanup in finally
                 else:
                      # Error already logged in helper, raise specific error
                      raise ValueError("Image preparation failed, check logs.")
             
-            # Determine generator based on whether image was processed
-            if image_path_for_generate:
-                logging.debug(f"Calling stream_generate with image path: {image_path_for_generate}")
+            # Determine generator based on whether images were processed
+            if image_paths_for_generate:
+                logging.debug(f"Calling stream_generate with {len(image_paths_for_generate)} image path(s): {', '.join(image_paths_for_generate)}")
                 generator = stream_generate(
                     model=model,
                     processor=processor,
                     prompt=prompt_text,
-                    image=image_path_for_generate,  # Pass the file path
+                    image=image_paths_for_generate,  # Pass the LIST of file paths
                     **generation_kwargs
                 )
             else:
                 # Text-only case
-                logging.debug("Calling stream_generate without image path")
+                logging.debug("Calling stream_generate without image paths")
                 generator = stream_generate(
                     model=model,
                     processor=processor,
@@ -573,49 +600,53 @@ class APIHandler(BaseHTTPRequestHandler):
             
         except Exception as e:
             logging.error(f"Error during streaming: {str(e)}")
-            raise
+            raise # Re-raise after logging
         finally:
-            # Clean up the temporary file using the stored object name
-            if temp_file is not None:
+            # Clean up the temporary files using the stored object names
+            logging.debug(f"Cleaning up {len(temp_files)} temporary image files.")
+            for temp_file in temp_files:
                 try:
-                    os.unlink(temp_file.name)
-                    logging.debug(f"Deleted temporary file: {temp_file.name}")
+                    if temp_file and hasattr(temp_file, 'name') and os.path.exists(temp_file.name):
+                        os.unlink(temp_file.name)
+                        logging.debug(f"Deleted temporary file: {temp_file.name}")
+                    elif temp_file and hasattr(temp_file, 'name'):
+                         logging.debug(f"Temporary file already deleted or never existed: {temp_file.name}")
                 except Exception as e:
-                    logging.warning(f"Error deleting temporary file: {str(e)}")
+                    logging.warning(f"Error deleting temporary file {getattr(temp_file, 'name', '[unknown]')}: {str(e)}")
     
-    def _complete_chat(self, model, processor, prompt_text, image_url, generation_kwargs):
+    def _complete_chat(self, model, processor, prompt_text, image_urls: List[str], generation_kwargs):
         """Generate complete chat response using the built-in stream_generate function."""
         full_text = ""
         prompt_tokens = 0
         completion_tokens = 0
-        temp_file = None
+        temp_files = [] # Store list of temp file objects for cleanup
         
         try:
-            # Process the image separately if needed
-            image_path_for_generate = None
-            if image_url:
-                 # Use the helper method
-                temp_path, temp_file_obj = self._prepare_image_for_generation(image_url)
-                if temp_path:
-                    image_path_for_generate = temp_path
-                    temp_file = temp_file_obj # Store file obj for cleanup in finally
+            # Process the images separately if needed
+            image_paths_for_generate = []
+            if image_urls:
+                 # Use the helper method which now returns lists
+                temp_paths, temp_files_objs = self._prepare_image_for_generation(image_urls)
+                if temp_paths:
+                    image_paths_for_generate = temp_paths
+                    temp_files = temp_files_objs # Store file objs list for cleanup in finally
                 else:
                     # Error already logged in helper, raise specific error
                     raise ValueError("Image preparation failed, check logs.")
             
-            # Determine generator based on whether image was processed
-            if image_path_for_generate:
-                logging.debug(f"Calling stream_generate with image path: {image_path_for_generate}")
+            # Determine generator based on whether images were processed
+            if image_paths_for_generate:
+                logging.debug(f"Calling stream_generate with {len(image_paths_for_generate)} image path(s): {', '.join(image_paths_for_generate)}")
                 generator = stream_generate(
                     model=model,
                     processor=processor,
                     prompt=prompt_text,
-                    image=image_path_for_generate,  # Pass the file path
+                    image=image_paths_for_generate,  # Pass the LIST of file paths
                     **generation_kwargs
                 )
             else:
                  # Text-only case
-                logging.debug("Calling stream_generate without image path")
+                logging.debug("Calling stream_generate without image paths")
                 generator = stream_generate(
                     model=model,
                     processor=processor,
@@ -659,15 +690,19 @@ class APIHandler(BaseHTTPRequestHandler):
             
         except Exception as e:
             logging.error(f"Error during chat completion: {str(e)}")
-            raise
+            raise # Re-raise after logging
         finally:
-            # Clean up the temporary file using the stored object name
-            if temp_file is not None:
+            # Clean up the temporary files using the stored object names
+            logging.debug(f"Cleaning up {len(temp_files)} temporary image files.")
+            for temp_file in temp_files:
                 try:
-                    os.unlink(temp_file.name)
-                    logging.debug(f"Deleted temporary file: {temp_file.name}")
+                    if temp_file and hasattr(temp_file, 'name') and os.path.exists(temp_file.name):
+                        os.unlink(temp_file.name)
+                        logging.debug(f"Deleted temporary file: {temp_file.name}")
+                    elif temp_file and hasattr(temp_file, 'name'):
+                         logging.debug(f"Temporary file already deleted or never existed: {temp_file.name}")
                 except Exception as e:
-                    logging.warning(f"Error deleting temporary file: {str(e)}")
+                    logging.warning(f"Error deleting temporary file {getattr(temp_file, 'name', '[unknown]')}: {str(e)}")
 
     def do_GET(self):
         """

@@ -1027,38 +1027,60 @@ def stream_generate(
     # Chat templates usually handle special tokens, so False is often correct here
     add_special_tokens = False
 
-    # --- Input Preparation ---
+    # --- Input Preparation --- (Modified for list of images) ---
     input_ids = None
     pixel_values = None
     mask = None
-    data_kwargs = {} # To hold extra processor outputs if any
+    data_kwargs = {} 
 
     try:
         if image:
             # --- Multimodal Case ---
-            # Load the image using the existing helper function
-            loaded_image = load_image(image)
+            images_to_process = []
+            if isinstance(image, list):
+                logging.debug(f"Loading {len(image)} images from list of paths.")
+                for i, img_path in enumerate(image):
+                    try:
+                        loaded_img = load_image(img_path)
+                        images_to_process.append(loaded_img)
+                        logging.debug(f"Successfully loaded image {i+1}/{len(image)}: {img_path}")
+                    except Exception as img_load_err:
+                        logging.error(f"Failed to load image {i+1}/{len(image)} from path {img_path}: {img_load_err}")
+                        # Optionally, decide whether to raise error or continue without this image
+                        raise ValueError(f"Failed to load image {img_path}") from img_load_err # Stop if any image fails
+            elif isinstance(image, str):
+                logging.debug("Loading single image from path.")
+                try:
+                    loaded_img = load_image(image)
+                    images_to_process.append(loaded_img)
+                except Exception as img_load_err:
+                     raise ValueError(f"Failed to load image {image}") from img_load_err
+            else:
+                raise TypeError(f"Unsupported type for 'image' parameter: {type(image)}")
 
-            # Use the processor to handle both text (containing <image> token) and the loaded image
-            # Try returning NumPy arrays first, fall back to PyTorch tensors if needed
+            if not images_to_process:
+                 raise ValueError("No images were successfully loaded for processing.")
+
+            # Use the processor with the LIST of loaded PIL images
             try:
-                # Pass text/images as lists for batch dimension consistency
                 inputs = processor(
-                    text=[prompt],
-                    images=[loaded_image],
+                    text=[prompt], # Still process text as a batch of 1
+                    images=images_to_process, # Pass the list of PIL images
                     return_tensors="np",
-                    padding=True # Let processor handle padding
+                    padding=True 
                 )
-                print("[INFO] Processed multimodal input with return_tensors='np'") # Debug info
+                logging.info(f"Processed multimodal input with {len(images_to_process)} image(s) using return_tensors='np'")
             except Exception as e_np:
-                print(f"\033[33mWarning\033[0m: Failed processing multimodal input with 'np': {e_np}. Trying 'pt'.")
+                logging.warning(f"\033[33mWarning\033[0m: Failed processing multimodal input with 'np': {e_np}. Trying 'pt'.")
                 try:
                      inputs = processor(
-                        text=[prompt], images=[loaded_image], return_tensors="pt", padding=True
+                        text=[prompt],
+                        images=images_to_process, # Pass list of PIL images
+                        return_tensors="pt", 
+                        padding=True
                     )
-                     print("[INFO] Processed multimodal input with return_tensors='pt'") # Debug info
+                     logging.info(f"Processed multimodal input with {len(images_to_process)} image(s) using return_tensors='pt'")
                 except Exception as e_pt:
-                     # If both fail, raise a clear error
                      raise ValueError(f"Failed processing multimodal input with both 'np' and 'pt': {e_pt}") from e_pt
 
             # Convert inputs to MLX arrays
@@ -1077,26 +1099,28 @@ def stream_generate(
                      except AttributeError:
                          # Handle cases where it might already be a list of arrays/tensors
                          if isinstance(pv, list):
-                              pv = np.stack(pv) # Stack list into a single NumPy array
+                             # Attempt to stack if elements are suitable (e.g., tensors/arrays)
+                              try:
+                                   pv = np.stack([p.numpy() if hasattr(p, 'numpy') else p for p in pv]) 
+                              except Exception as stack_err:
+                                   raise TypeError(f"Could not stack pixel_values list elements: {stack_err}")
                          else:
                               raise TypeError(f"Unexpected type for pixel_values: {type(pv)}")
                  pixel_values = mx.array(pv)
             else:
-                 print("\033[33mWarning\033[0m: 'pixel_values' or 'images' not found in processor output.")
+                 logging.warning("\033[33mWarning\033[0m: 'pixel_values' or 'images' not found in processor output.")
                  pixel_values = None # Explicitly set to None if not found
 
 
             # Pass along any other relevant keys returned by the processor
-            # Convert non-string/list values to mx.array
             data_kwargs = {
                 k: mx.array(v) for k, v in inputs.items()
                 if k not in ["input_ids", "pixel_values", "attention_mask", "images"] and not isinstance(v, (str, list))
             }
-            # Update kwargs for generate_step, prioritizing specific data_kwargs
             kwargs.update(data_kwargs)
 
         else:
-            # --- Text-Only Case ---
+            # --- Text-Only Case (remains the same) ---
             # Tokenize the prompt directly using the tokenizer
             # Use np tensors directly as MLX handles them well
             inputs = tokenizer(
