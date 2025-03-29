@@ -264,9 +264,24 @@ class APIHandler(BaseHTTPRequestHandler):
             self.end_headers()
             
             # Get the model and processor
-            model, processor = self.model_provider.get_model()
-            tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+            try:
+                model, processor = self.model_provider.get_model()
+                tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+            except Exception as e:
+                logging.error(f"Failed to load model/processor: {str(e)}")
+                self._set_completion_headers(500) # Internal Server Error
+                self.end_headers()
+                error_response = {
+                    "error": {
+                        "message": f"Failed to load model: {str(e)}",
+                        "type": "server_error",
+                        "code": 500
+                    }
+                }
+                self.wfile.write(json.dumps(error_response).encode())
+                return # Stop processing the request
             
+            # Proceed with handling the completion if model loaded successfully
             try:
                 self.handle_chat_completions(model, processor, tokenizer)
             except Exception as e:
@@ -288,6 +303,53 @@ class APIHandler(BaseHTTPRequestHandler):
             self._set_completion_headers(404)
             self.end_headers()
             self.wfile.write(b'{"error": "Not Found"}')
+
+    def _prepare_image_for_generation(self, image_url: str) -> Tuple[Optional[str], Optional[tempfile._TemporaryFileWrapper]]:
+        """Loads image from URL, saves to temp file, returns path and file object."""
+        temp_file = None
+        temp_path = None
+        try:
+            pil_image = load_image_from_url(image_url)
+            logging.debug(f"Loaded image successfully: {pil_image.size}, mode: {pil_image.mode}")
+
+            temp_file = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
+            temp_path = temp_file.name
+            temp_file.close() # Close for saving
+
+            logging.debug(f"Temporary file path created: {temp_path}")
+
+            if pil_image.mode != "RGB":
+                pil_image = pil_image.convert("RGB")
+
+            pil_image.save(temp_path, format="JPEG")
+            logging.debug(f"Saved image to temporary file: {temp_path}")
+
+            # Verify save
+            if os.path.exists(temp_path) and os.path.getsize(temp_path) > 0:
+                logging.debug(f"Temporary file verified (exists, size > 0): {temp_path}")
+                return temp_path, temp_file # Return path AND the file object wrapper for cleanup
+            else:
+                logging.error(f"Failed to save or verify temporary image file: {temp_path}")
+                # Clean up if save failed
+                if temp_file:
+                    try:
+                        os.unlink(temp_path)
+                    except OSError as e:
+                         logging.warning(f"Error deleting failed temp file {temp_path}: {e}")
+                return None, None
+
+        except Exception as e:
+            logging.error(f"Error preparing image: {str(e)}")
+            # Clean up if any exception occurred
+            if temp_path and os.path.exists(temp_path):
+                 try:
+                     os.unlink(temp_path)
+                 except OSError as e_unlink:
+                     logging.warning(f"Error deleting temp file {temp_path} after exception: {e_unlink}")
+            elif temp_file:
+                 # If temp_file object exists but path wasn't set or file wasn't created
+                 pass # Nothing to unlink
+            raise ValueError(f"Failed to prepare image: {str(e)}")
 
     def handle_chat_completions(self, model, processor, tokenizer):
         """
@@ -426,49 +488,30 @@ class APIHandler(BaseHTTPRequestHandler):
         
         try:
             # Process the image separately if needed
+            image_path_for_generate = None
             if image_url:
-                try:
-                    # Load the image properly
-                    pil_image = load_image_from_url(image_url)
-                    logging.debug(f"Loaded image successfully: {pil_image.size}, mode: {pil_image.mode}")
-                    
-                    # Save the image to a temporary file
-                    # NOTE: stream_generate expects a file path string, not a PIL image object
-                    temp_file = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
-                    temp_path = temp_file.name  # Get the path string
-                    temp_file.close()  # Close it so we can reopen it for saving
-                    
-                    # Check if the path exists before saving
-                    file_exists = os.path.exists(temp_path)
-                    logging.debug(f"Temporary file path exists before saving: {file_exists}, path: {temp_path}")
-                    
-                    # Ensure the image is in RGB mode for compatibility
-                    if pil_image.mode != "RGB":
-                        pil_image = pil_image.convert("RGB")
-                    
-                    # Save the image to the temporary file
-                    pil_image.save(temp_path, format="JPEG")
-                    logging.debug(f"Saved image to temporary file: {temp_path}")
-                    
-                    # Verify the file exists and has content after saving
-                    file_exists = os.path.exists(temp_path)
-                    file_size = os.path.getsize(temp_path) if file_exists else 0
-                    logging.debug(f"Temporary file exists after saving: {file_exists}, size: {file_size} bytes, path: {temp_path}")
-                    
-                    # Use the string path for stream_generate
-                    logging.debug(f"Calling stream_generate with image path: {temp_path}")
-                    generator = stream_generate(
-                        model=model,
-                        processor=processor,
-                        prompt=prompt_text,
-                        image=temp_path,  # Pass the file path as string
-                        **generation_kwargs
-                    )
-                except Exception as e:
-                    logging.error(f"Error processing image: {str(e)}")
-                    raise ValueError(f"Failed to process image: {str(e)}")
+                # Use the helper method
+                temp_path, temp_file_obj = self._prepare_image_for_generation(image_url)
+                if temp_path:
+                    image_path_for_generate = temp_path
+                    temp_file = temp_file_obj # Store file obj for cleanup in finally
+                else:
+                     # Error already logged in helper, raise specific error
+                     raise ValueError("Image preparation failed, check logs.")
+            
+            # Determine generator based on whether image was processed
+            if image_path_for_generate:
+                logging.debug(f"Calling stream_generate with image path: {image_path_for_generate}")
+                generator = stream_generate(
+                    model=model,
+                    processor=processor,
+                    prompt=prompt_text,
+                    image=image_path_for_generate,  # Pass the file path
+                    **generation_kwargs
+                )
             else:
                 # Text-only case
+                logging.debug("Calling stream_generate without image path")
                 generator = stream_generate(
                     model=model,
                     processor=processor,
@@ -532,7 +575,7 @@ class APIHandler(BaseHTTPRequestHandler):
             logging.error(f"Error during streaming: {str(e)}")
             raise
         finally:
-            # Clean up the temporary file
+            # Clean up the temporary file using the stored object name
             if temp_file is not None:
                 try:
                     os.unlink(temp_file.name)
@@ -549,49 +592,30 @@ class APIHandler(BaseHTTPRequestHandler):
         
         try:
             # Process the image separately if needed
+            image_path_for_generate = None
             if image_url:
-                try:
-                    # Load the image properly
-                    pil_image = load_image_from_url(image_url)
-                    logging.debug(f"Loaded image successfully: {pil_image.size}, mode: {pil_image.mode}")
-                    
-                    # Save the image to a temporary file
-                    # NOTE: stream_generate expects a file path string, not a PIL image object
-                    temp_file = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
-                    temp_path = temp_file.name  # Get the path string
-                    temp_file.close()  # Close it so we can reopen it for saving
-                    
-                    # Check if the path exists before saving
-                    file_exists = os.path.exists(temp_path)
-                    logging.debug(f"Temporary file path exists before saving: {file_exists}, path: {temp_path}")
-                    
-                    # Ensure the image is in RGB mode for compatibility
-                    if pil_image.mode != "RGB":
-                        pil_image = pil_image.convert("RGB")
-                    
-                    # Save the image to the temporary file
-                    pil_image.save(temp_path, format="JPEG")
-                    logging.debug(f"Saved image to temporary file: {temp_path}")
-                    
-                    # Verify the file exists and has content after saving
-                    file_exists = os.path.exists(temp_path)
-                    file_size = os.path.getsize(temp_path) if file_exists else 0
-                    logging.debug(f"Temporary file exists after saving: {file_exists}, size: {file_size} bytes, path: {temp_path}")
-                    
-                    # Use the string path for stream_generate
-                    logging.debug(f"Calling stream_generate with image path: {temp_path}")
-                    generator = stream_generate(
-                        model=model,
-                        processor=processor,
-                        prompt=prompt_text,
-                        image=temp_path,  # Pass the file path as string
-                        **generation_kwargs
-                    )
-                except Exception as e:
-                    logging.error(f"Error processing image: {str(e)}")
-                    raise ValueError(f"Failed to process image: {str(e)}")
+                 # Use the helper method
+                temp_path, temp_file_obj = self._prepare_image_for_generation(image_url)
+                if temp_path:
+                    image_path_for_generate = temp_path
+                    temp_file = temp_file_obj # Store file obj for cleanup in finally
+                else:
+                    # Error already logged in helper, raise specific error
+                    raise ValueError("Image preparation failed, check logs.")
+            
+            # Determine generator based on whether image was processed
+            if image_path_for_generate:
+                logging.debug(f"Calling stream_generate with image path: {image_path_for_generate}")
+                generator = stream_generate(
+                    model=model,
+                    processor=processor,
+                    prompt=prompt_text,
+                    image=image_path_for_generate,  # Pass the file path
+                    **generation_kwargs
+                )
             else:
-                # Text-only case
+                 # Text-only case
+                logging.debug("Calling stream_generate without image path")
                 generator = stream_generate(
                     model=model,
                     processor=processor,
@@ -637,7 +661,7 @@ class APIHandler(BaseHTTPRequestHandler):
             logging.error(f"Error during chat completion: {str(e)}")
             raise
         finally:
-            # Clean up the temporary file
+            # Clean up the temporary file using the stored object name
             if temp_file is not None:
                 try:
                     os.unlink(temp_file.name)
