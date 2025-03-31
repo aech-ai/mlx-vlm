@@ -17,6 +17,8 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from io import BytesIO
 from typing import Any, Dict, Generator, List, Optional, Tuple, Union
 import urllib.request
+import copy
+import re
 
 import mlx.core as mx
 import numpy as np
@@ -211,6 +213,13 @@ class APIHandler(BaseHTTPRequestHandler):
         self.model_provider = model_provider
         self.prompt_cache = prompt_cache or PromptCache()
         self.system_fingerprint = system_fingerprint
+        self.function_calling_system_prompt = (
+            "You have access to the following functions:\n"
+            "{function_descriptions}\n\n"
+            "To call a function, respond with a JSON object with the following structure:\n"
+            "{{\"function_name\": \"<function_name>\", \"arguments\": {{<arguments>}}}}\n\n"
+            "If multiple functions are needed, respond with a list of JSON objects, each with a function_name and arguments."
+        )
         BaseHTTPRequestHandler.__init__(self, *args, **kwargs)
 
     def _set_completion_headers(self, status_code=200):
@@ -261,6 +270,43 @@ class APIHandler(BaseHTTPRequestHandler):
         self.top_logprobs = None
         if self.logprobs:
             self.top_logprobs = self.body.get("top_logprobs", 0)
+
+        # Extract function calling parameters
+        self.functions = self.body.get("functions", [])
+        self.tools = self.body.get("tools", [])
+        self.function_call = self.body.get("function_call", None)
+        self.tool_choice = self.body.get("tool_choice", None)
+        
+        # Normalize tools to functions format for internal processing
+        # This handles both the older 'functions' and newer 'tools' formats
+        self.normalized_functions = []
+        
+        # Convert tools to normalized function format
+        if self.tools:
+            for tool in self.tools:
+                if tool.get("type") == "function":
+                    self.normalized_functions.append(tool.get("function", {}))
+        
+        # Add regular functions
+        if self.functions:
+            self.normalized_functions.extend(self.functions)
+            
+        # Process tool_choice/function_call
+        self.selected_function = None
+        if self.tool_choice:
+            if isinstance(self.tool_choice, dict) and self.tool_choice.get("type") == "function":
+                self.selected_function = self.tool_choice.get("function", {}).get("name")
+            elif self.tool_choice == "auto":
+                self.selected_function = "auto"
+            elif self.tool_choice == "none":
+                self.selected_function = "none"
+        elif self.function_call:
+            if isinstance(self.function_call, dict):
+                self.selected_function = self.function_call.get("name")
+            elif self.function_call == "auto":
+                self.selected_function = "auto"
+            elif self.function_call == "none":
+                self.selected_function = "none"
 
         # Determine endpoint and handle request
         if self.path == "/v1/chat/completions":
@@ -537,6 +583,27 @@ class APIHandler(BaseHTTPRequestHandler):
             prompt_text = default_chat_template(messages, template=self.model_provider.default_chat_template)
             logging.debug(f"Fell back to default_chat_template after error: {prompt_text[:100]}...")
         
+        # Process function calling
+        function_calling_enabled = False
+        function_descriptions = ""
+        
+        if self.normalized_functions and self.selected_function != "none":
+            function_calling_enabled = True
+            # Format functions for inclusion in prompt
+            function_descriptions = self._format_functions_for_model(self.normalized_functions)
+            
+            # Add function calling system prompt before the main prompt if using functions
+            if function_descriptions:
+                # Add a system message to the beginning of the conversation if none exists
+                if not messages or messages[0]["role"] != "system":
+                    system_content = "You are a helpful assistant that can use functions when needed."
+                    if function_descriptions:
+                        system_content += "\n\n" + function_descriptions
+                    messages.insert(0, {"role": "system", "content": system_content})
+                else:
+                    # Append to existing system message
+                    messages[0]["content"] += "\n\n" + function_descriptions
+
         # Generation parameters
         generation_kwargs = {
             "max_tokens": max_tokens,
@@ -635,6 +702,67 @@ class APIHandler(BaseHTTPRequestHandler):
                 self.wfile.write(f"data: {json.dumps(response)}\n\n".encode())
                 self.wfile.flush()
             
+            # Check if the response is a function call
+            function_name, arguments, parsed_successfully = self._parse_function_call(full_text)
+            finish_reason = "stop"
+            
+            if self.normalized_functions and parsed_successfully and function_name:
+                logging.info(f"Detected function call in streaming mode: {function_name} with arguments: {arguments}")
+                finish_reason = "function_call"
+                
+                # For streaming, send the function call as a special final chunk
+                function_call = {
+                    "name": function_name,
+                    "arguments": json.dumps(arguments)
+                }
+                
+                tool_calls = [{
+                    "id": f"call_{uuid.uuid4()}",
+                    "type": "function",
+                    "function": {
+                        "name": function_name,
+                        "arguments": json.dumps(arguments)
+                    }
+                }]
+                
+                # Create special response with the function call
+                if self.stream:
+                    # For streaming, we first send an empty content delta
+                    function_response = {
+                        "id": self.request_id,
+                        "model": self.requested_model,
+                        "created": self.created,
+                        "object": self.object_type,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"content": None},
+                                "finish_reason": None
+                            }
+                        ]
+                    }
+                    
+                    self.wfile.write(f"data: {json.dumps(function_response)}\n\n".encode())
+                    self.wfile.flush()
+                    
+                    # Then send the function_call delta
+                    function_response = {
+                        "id": self.request_id,
+                        "model": self.requested_model,
+                        "created": self.created,
+                        "object": self.object_type,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"function_call": function_call},
+                                "finish_reason": None
+                            }
+                        ]
+                    }
+                    
+                    self.wfile.write(f"data: {json.dumps(function_response)}\n\n".encode())
+                    self.wfile.flush()
+            
             # Send the final chunk with finish_reason
             response = {
                 "id": self.request_id,
@@ -645,7 +773,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     {
                         "index": 0,
                         "delta": {},
-                        "finish_reason": "stop"
+                        "finish_reason": finish_reason
                     }
                 ]
             }
@@ -726,7 +854,49 @@ class APIHandler(BaseHTTPRequestHandler):
                 prompt_tokens = gen_result.prompt_tokens
                 completion_tokens = gen_result.generation_tokens
             
-            # Build the complete response
+            # Check if the response is a function call
+            finish_reason = "stop"
+            function_call = None
+            tool_calls = None
+            
+            if self.normalized_functions:
+                function_name, arguments, parsed_successfully = self._parse_function_call(full_text)
+                if parsed_successfully and function_name:
+                    logging.info(f"Detected function call: {function_name} with arguments: {arguments}")
+                    finish_reason = "function_call"
+                    
+                    # Format as function_call for backwards compatibility
+                    function_call = {
+                        "name": function_name,
+                        "arguments": json.dumps(arguments)
+                    }
+                    
+                    # Format as tool_calls for newer format
+                    tool_calls = [{
+                        "id": f"call_{uuid.uuid4()}",
+                        "type": "function",
+                        "function": {
+                            "name": function_name,
+                            "arguments": json.dumps(arguments)
+                        }
+                    }]
+                    
+                    # For XML-style function calls, replace the raw output in content
+                    if "<function_call" in full_text and "</function_call>" in full_text:
+                        full_text = f"Function call: {function_name}"
+            
+            # Update the response object to include function_call or tool_calls if present
+            message = {
+                "role": "assistant",
+                "content": full_text
+            }
+            
+            if function_call:
+                message["function_call"] = function_call
+                
+            if tool_calls:
+                message["tool_calls"] = tool_calls
+            
             response = {
                 "id": self.request_id,
                 "object": "chat.completion",
@@ -736,11 +906,8 @@ class APIHandler(BaseHTTPRequestHandler):
                 "choices": [
                     {
                         "index": 0,
-                        "message": {
-                            "role": "assistant",
-                            "content": full_text
-                        },
-                        "finish_reason": "stop"
+                        "message": message,
+                        "finish_reason": finish_reason
                     }
                 ],
                 "usage": {
@@ -810,6 +977,127 @@ class APIHandler(BaseHTTPRequestHandler):
         
         self.wfile.write(response_json)
         self.wfile.flush()
+
+    def _parse_function_call(self, text):
+        """
+        Parse function calls from generated text.
+        Handles various JSON formats following the OpenAI API specification.
+        Returns a tuple of (function_name, arguments, parsed_successfully)
+        """
+        # Extract JSON objects that might contain function calls
+        potential_json_objects = self._extract_json_objects(text)
+        
+        for json_obj in potential_json_objects:
+            try:
+                obj = json.loads(json_obj)
+                
+                # Format 1: {"name": "function_name", "arguments": {...}}
+                # This is the standard OpenAI format
+                if isinstance(obj, dict) and "name" in obj and "arguments" in obj:
+                    function_name = obj["name"]
+                    arguments = obj["arguments"]
+                    if isinstance(arguments, str):
+                        try:
+                            arguments = json.loads(arguments)
+                        except json.JSONDecodeError:
+                            pass  # Keep arguments as string if not valid JSON
+                    return function_name, arguments, True
+                
+                # Format 2: {"function_name": "name", "arguments": {...}}
+                # Alternative format for backward compatibility
+                elif isinstance(obj, dict) and "function_name" in obj and "arguments" in obj:
+                    function_name = obj["function_name"]
+                    arguments = obj["arguments"]
+                    if isinstance(arguments, str):
+                        try:
+                            arguments = json.loads(arguments)
+                        except json.JSONDecodeError:
+                            pass  # Keep arguments as string if not valid JSON
+                    return function_name, arguments, True
+                
+                # Format 3: {"function": {"name": "function_name", "arguments": {...}}}
+                # Used in some nested contexts
+                elif isinstance(obj, dict) and "function" in obj and isinstance(obj["function"], dict):
+                    func_obj = obj["function"]
+                    if "name" in func_obj and "arguments" in func_obj:
+                        function_name = func_obj["name"]
+                        arguments = func_obj["arguments"]
+                        if isinstance(arguments, str):
+                            try:
+                                arguments = json.loads(arguments)
+                            except json.JSONDecodeError:
+                                pass  # Keep arguments as string if not valid JSON
+                        return function_name, arguments, True
+                
+                # Format 4: Nested JSON with function_call data
+                # Example: {"type": "function_call", "data": {"function_name": "name", "arguments": {...}}}
+                elif isinstance(obj, dict) and "data" in obj and isinstance(obj["data"], dict):
+                    data_obj = obj["data"]
+                    if "function_name" in data_obj and "arguments" in data_obj:
+                        function_name = data_obj["function_name"]
+                        arguments = data_obj["arguments"]
+                        if isinstance(arguments, str):
+                            try:
+                                arguments = json.loads(arguments)
+                            except json.JSONDecodeError:
+                                pass
+                        return function_name, arguments, True
+                
+            except (json.JSONDecodeError, TypeError, KeyError) as e:
+                logging.debug(f"Failed to parse potential JSON object: {str(e)}")
+                # Continue to the next potential JSON object
+        
+        # If we couldn't parse anything, return None
+        return None, None, False
+
+    def _extract_json_objects(self, text):
+        """
+        Extract potential JSON objects from text.
+        This handles multiple JSON objects and even nested ones.
+        """
+        potential_objects = []
+        
+        # Simple case: try to find objects enclosed in curly braces
+        brace_pattern = r'(\{(?:[^{}]|(?:\{[^{}]*\}))*\})'
+        matches = re.finditer(brace_pattern, text, re.DOTALL)
+        for match in matches:
+            potential_objects.append(match.group(1))
+        
+        # Look for code blocks that might contain JSON (markdown format)
+        code_block_pattern = r'```(?:json)?\s*([\s\S]*?)```'
+        code_matches = re.finditer(code_block_pattern, text, re.DOTALL)
+        for match in code_matches:
+            code_content = match.group(1).strip()
+            # If it starts with a curly brace, it might be JSON
+            if code_content.startswith('{') and code_content.endswith('}'):
+                potential_objects.append(code_content)
+        
+        return potential_objects
+
+    def _format_functions_for_model(self, functions):
+        """
+        Format the functions for inclusion in the prompt.
+        Uses standard OpenAI API-compatible JSON format.
+        """
+        # Standard OpenAI-style JSON format
+        formatted_instructions = "You have access to the following functions:\n\n"
+        
+        for i, func in enumerate(functions):
+            formatted_instructions += f"{i+1}. {func.get('name')}: {func.get('description', '')}\n"
+            if "parameters" in func:
+                formatted_instructions += f"   Parameters: {json.dumps(func.get('parameters', {}), indent=2)}\n\n"
+        
+        # Add instructions on how to call functions
+        formatted_instructions += "\nTo call a function, respond with a JSON object formatted as:\n"
+        formatted_instructions += "{\n"
+        formatted_instructions += '  "name": "function_name",\n'
+        formatted_instructions += '  "arguments": {\n'
+        formatted_instructions += '    "param1": "value1",\n'
+        formatted_instructions += '    "param2": "value2"\n'
+        formatted_instructions += "  }\n"
+        formatted_instructions += "}\n"
+        
+        return formatted_instructions
 
 
 def run(
