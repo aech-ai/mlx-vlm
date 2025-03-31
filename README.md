@@ -158,7 +158,7 @@ MLX-VLM includes an OpenAI-compatible server that allows you to use your MLX mod
 Start the server with:
 
 ```sh
-python -m mlx_vlm.server --model mlx-community/Qwen2-VL-2B-Instruct-4bit --port 8000
+python -m mlx_vlm.server --model mlx-community/Mistral-Small-3.1-24B-Instruct-2503-4bit --host 127.0.0.1 --port 8000 --log-level DEBUG
 ```
 
 Server options:
@@ -166,6 +166,7 @@ Server options:
 - `--port`: The port to listen on (default: 8000)
 - `--host`: The host to bind to (default: "127.0.0.1")
 - `--max-tokens`: Maximum new tokens to generate (default: 1024)
+- `--log-level`: Logging level (default: "INFO")
 
 ### Using the Server
 
