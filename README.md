@@ -12,6 +12,13 @@ MLX-VLM is a package for inference and fine-tuning of Vision Language Models (VL
 - [Multi-Image Chat Support](#multi-image-chat-support)
   - [Supported Models](#supported-models)
   - [Usage Examples](#usage-examples)
+- [Video Understanding](#video-understanding)
+  - [Supported Models](#supported-models-1)
+  - [Usage Examples](#usage-examples-1)
+- [OpenAI-Compatible Server](#openai-compatible-server)
+  - [Starting the Server](#starting-the-server)
+  - [Using the Server](#using-the-server)
+  - [Example Scripts](#example-scripts)
 - [Fine-tuning](#fine-tuning)
 
 ## Installation
@@ -136,8 +143,133 @@ With more coming soon.
 python -m mlx_vlm.video_generate --model mlx-community/Qwen2-VL-2B-Instruct-4bit --max-tokens 100 --prompt "Describe this video" --video path/to/video.mp4 --max-pixels 224 224 --fps 1.0
 ```
 
+## OpenAI-Compatible Server
 
-These examples demonstrate how to use multiple images with MLX-VLM for more complex visual reasoning tasks.
+MLX-VLM includes an OpenAI-compatible server that allows you to use your MLX models with any OpenAI API client. The server supports:
+
+- Chat completions endpoint
+- Image analysis (base64 or URL)
+- Streaming responses
+- Function calling (tools API)
+- Multiple image inputs
+
+### Starting the Server
+
+Start the server with:
+
+```sh
+python -m mlx_vlm.server --model mlx-community/Qwen2-VL-2B-Instruct-4bit --port 8000
+```
+
+Server options:
+- `--model`: The model to use (default: "mlx-community/Qwen2-VL-2B-Instruct-4bit")
+- `--port`: The port to listen on (default: 8000)
+- `--host`: The host to bind to (default: "127.0.0.1")
+- `--max-tokens`: Maximum new tokens to generate (default: 1024)
+
+### Using the Server
+
+Once the server is running, you can use it with any OpenAI API client. The server implements the `/v1/chat/completions` endpoint.
+
+#### Python Example with OpenAI SDK
+
+```python
+from openai import OpenAI
+
+# Create a client with a custom base URL
+client = OpenAI(
+    base_url="http://127.0.0.1:8000/v1",  # Local MLX-VLM server
+    api_key="not-needed"  # API key not required
+)
+
+# Create a chat completion
+response = client.chat.completions.create(
+    model="any-model-name",  # Model name is ignored, using the loaded model
+    messages=[
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": "What's in this image?"}
+    ],
+    temperature=0.7,
+    max_tokens=500
+)
+
+print(response.choices[0].message.content)
+```
+
+#### Image Analysis
+
+To analyze images, include them in the user message:
+
+```python
+response = client.chat.completions.create(
+    model="any-model-name",
+    messages=[
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": [
+            {"type": "text", "text": "What's in this image?"},
+            {"type": "image_url", "image_url": {"url": "https://example.com/image.jpg"}}
+        ]}
+    ]
+)
+```
+
+#### Function Calling
+
+The server supports OpenAI's function calling (tools API):
+
+```python
+response = client.chat.completions.create(
+    model="any-model-name",
+    messages=[
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": "What's the weather in Paris?"}
+    ],
+    tools=[{
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get the current weather in a location",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "location": {
+                        "type": "string",
+                        "description": "The city name"
+                    },
+                    "unit": {
+                        "type": "string",
+                        "enum": ["celsius", "fahrenheit"]
+                    }
+                },
+                "required": ["location"]
+            }
+        }
+    }],
+    tool_choice="auto"
+)
+```
+
+### Example Scripts
+
+The repository includes several example scripts that demonstrate how to use the server:
+
+- `examples/server/openai_function_call_test.py`: Demonstrates the complete function calling workflow
+- `examples/server/stream_client.py`: Shows how to use streaming with image inputs
+
+Run the examples:
+
+```sh
+# Install dependencies
+pip install -r examples/server/requirements.txt
+
+# Run the function calling example
+python examples/server/openai_function_call_test.py
+
+# Run the streaming client
+python examples/server/stream_client.py "Describe this image" "https://example.com/image.jpg"
+```
+
+For more details, see the documentation in the `examples/server` directory.
 
 # Fine-tuning
 
